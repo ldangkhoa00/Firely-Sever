@@ -25,9 +25,21 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     });
 
 builder.Services.AddControllers();
+
+// [BỔ SUNG] 3. Đăng ký dịch vụ Swagger để tự động quét các API của bạn
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
 var app = builder.Build();
 
-// 3. Kích hoạt cửa an ninh
+// [BỔ SUNG] 4. Kích hoạt giao diện web Swagger (chỉ chạy trong môi trường code/Development)
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// 5. Kích hoạt cửa an ninh
 app.UseAuthentication();
 app.UseAuthorization();
 app.MapControllers();

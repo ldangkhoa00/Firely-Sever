@@ -29,6 +29,7 @@ namespace HospitalUsers.Controllers
             public string StaffId { get; set; } = string.Empty;
             public string Password { get; set; } = string.Empty;
             public string FullName { get; set; } = string.Empty;
+            public string HospitalEmail { get; set; } = string.Empty;   
             public string PhoneNumber { get; set; } = string.Empty;
             public string DepartmentId { get; set; } = string.Empty;
             public string Role { get; set; } = "Nurse"; 
@@ -121,6 +122,45 @@ namespace HospitalUsers.Controllers
 
             // 6. Trả thẻ về cho Giao diện
             return Ok(new { token = tokenString });
+        }
+        // --- API CHO QUẢN TRỊ VIÊN: DUYỆT TÀI KHOẢN ---
+        // Đường dẫn của API này sẽ là: PUT api/Auth/approve/{staffId}
+        [HttpPut("approve/{staffId}")]
+        public IActionResult ApproveUser(string staffId)
+        {
+            // BƯỚC 1: Tìm nhân viên trong Database dựa vào Mã Nhân Viên (staffId) truyền vào từ URL
+            var user = _context.Users.FirstOrDefault(u => u.StaffId == staffId);
+
+            // BƯỚC 2: Kiểm tra xem nhân viên có tồn tại không
+            if (user == null)
+            {
+                return NotFound(new { message = $"Không tìm thấy nhân viên với mã: {staffId}" });
+            }
+
+            // BƯỚC 3: Kiểm tra xem tài khoản này có đúng là đang cần duyệt không
+            if (user.Status == "ACTIVE")
+            {
+                return BadRequest(new { message = "Tài khoản này đã được kích hoạt từ trước rồi!" });
+            }
+
+            if (user.Status == "SUSPENDED")
+            {
+                return BadRequest(new { message = "Không thể duyệt tài khoản đang bị khóa hình phạt. Hãy mở khóa trước." });
+            }
+
+            // BƯỚC 4: THỰC THI QUYỀN LỰC CỦA ADMIN - CẬP NHẬT TRẠNG THÁI
+            // Đổi từ PENDING_APPROVAL sang ACTIVE
+            user.Status = "ACTIVE";
+
+            // BƯỚC 5: Lưu thay đổi vào SQL Server
+            _context.SaveChanges();
+
+            // Trả về thông báo thành công cho giao diện Admin
+            return Ok(new 
+            { 
+                message = $"Đã duyệt thành công tài khoản cho nhân viên: {user.FullName}",
+                newStatus = user.Status 
+            });
         }
     }
 }
