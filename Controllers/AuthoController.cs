@@ -1,10 +1,12 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
 using HospitalUsers.Data;
 using HospitalUsers.Models;
+using Microsoft.AspNetCore.Authorization;
 using HospitalUsers.Security; // Nơi chứa PasswordHasher
 
 namespace HospitalUsers.Controllers
@@ -38,6 +40,25 @@ namespace HospitalUsers.Controllers
         [HttpPost("register")]
         public IActionResult Register([FromBody] RegisterRequest request)
         {
+            
+            // BẢO MẬT: Chỉ cho phép đăng ký Nurse hoặc Doctor.
+            // Chuẩn hóa chữ hoa/chữ thường trước khi lưu.
+
+            string? normalizedRole = request.Role?.Trim().ToLowerInvariant() switch
+            {
+                "nurse" => "Nurse",
+                "doctor" => "Doctor",
+                _ => null
+            };
+
+            if (normalizedRole == null)
+            {
+                return BadRequest(new
+                {
+                    message = "Vai trò đăng ký không hợp lệ. Chỉ được đăng ký Nurse hoặc Doctor."
+                });
+            }
+
             // 1. Kiểm tra xem mã nhân viên đã tồn tại chưa
             if (_context.Users.Any(u => u.StaffId == request.StaffId))
             {
@@ -55,7 +76,7 @@ namespace HospitalUsers.Controllers
                 FullName = request.FullName,
                 PhoneNumber = request.PhoneNumber,
                 DepartmentId = request.DepartmentId,
-                Role = request.Role,
+                Role = normalizedRole,
                 Status = "PENDING_APPROVAL" // LUÔN LUÔN Ở TRẠNG THÁI CHỜ DUYỆT
             };
 
@@ -92,26 +113,54 @@ namespace HospitalUsers.Controllers
             }
 
             // 4. Kiểm tra trạng thái Zero-Trust (Nếu chưa được duyệt thì chặn lại)
+
+            // Tài khoản đang chờ Admin duyệt
             if (user.Status == "PENDING_APPROVAL")
             {
-                return StatusCode(403, new { message = "Tài khoản của bạn đang chờ Quản trị viên duyệt." });
-            }
-            if (user.Status == "SUSPENDED")
-            {
-                return StatusCode(403, new { message = "Tài khoản đã bị tạm khóa." });
+                return StatusCode(403, new
+                {
+                    message = "Tài khoản của bạn đang chờ Quản trị viên duyệt."
+                });
             }
 
+            // Tài khoản đã bị khóa
+            if (user.Status == "SUSPENDED")
+            {
+                return StatusCode(403, new
+                {
+                    message = "Tài khoản đã bị tạm khóa."
+                });
+            }
+
+            // BẢO MẬT: Mọi trạng thái khác ACTIVE đều bị từ chối
+            if (user.Status != "ACTIVE")
+            {
+                return StatusCode(403, new
+                {
+                    message = "Trạng thái tài khoản không hợp lệ hoặc chưa được kích hoạt. Vui lòng liên hệ quản trị viên."
+                });
+            }
+
+
             // 5. Mọi thứ OK -> Tạo JWT Token
-            var tokenHandler = new JwtSecurityTokenHandler();
-            var key = Encoding.UTF8.GetBytes(_config["JwtSettings:Key"] ?? "KhoaBaoMatCuaBenhVienRatDai123456789");
             
+            var tokenHandler = new JwtSecurityTokenHandler();
+
+            var configuredKey = _config["JwtSettings:Key"]
+                ?? throw new InvalidOperationException(
+                    "Chua cau hinh JwtSettings:Key."
+                );
+
+            var key = Encoding.UTF8.GetBytes(configuredKey);
+
             var tokenDescriptor = new SecurityTokenDescriptor
             {
                 Subject = new ClaimsIdentity(new[]
                 {
                     new Claim(ClaimTypes.NameIdentifier, user.StaffId),
                     new Claim(ClaimTypes.Role, user.Role),
-                    new Claim("DepartmentId", user.DepartmentId) // GHI CHÚ MÃ PHÒNG LÊN THẺ
+                    new Claim("DepartmentId", user.DepartmentId), // GHI CHÚ MÃ PHÒNG LÊN THẺ
+                    new Claim("TokenVersion", user.TokenVersion.ToString())
                 }),
                 Expires = DateTime.UtcNow.AddHours(8), // Thẻ có hạn 8 tiếng (1 ca trực)
                 SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
@@ -125,6 +174,7 @@ namespace HospitalUsers.Controllers
         }
         // --- API CHO QUẢN TRỊ VIÊN: DUYỆT TÀI KHOẢN ---
         // Đường dẫn của API này sẽ là: PUT api/Auth/approve/{staffId}
+        [Authorize(Roles = "Admin")]
         [HttpPut("approve/{staffId}")]
         public IActionResult ApproveUser(string staffId)
         {
@@ -160,6 +210,58 @@ namespace HospitalUsers.Controllers
             { 
                 message = $"Đã duyệt thành công tài khoản cho nhân viên: {user.FullName}",
                 newStatus = user.Status 
+            });
+            
+        }
+                
+        [Authorize(Roles = "Admin")]
+        [HttpPut("revoke-sessions/{staffId}")]
+        public async Task<IActionResult> RevokeSessions(string staffId)
+        {
+            // 1. Kiểm tra mã nhân viên
+            if (string.IsNullOrWhiteSpace(staffId))
+            {
+                return BadRequest(new
+                {
+                    message = "Mã nhân viên không hợp lệ."
+                });
+            }
+
+    // 2. Tăng TokenVersion trực tiếp trong SQL Server
+    int affectedRows = await _context.Users
+        .Where(u => u.StaffId == staffId
+                 && u.TokenVersion < int.MaxValue)
+        .ExecuteUpdateAsync(setters => setters
+            .SetProperty(
+                u => u.TokenVersion,
+                u => u.TokenVersion + 1
+            )
+        );
+
+            // 3. Nếu không cập nhật được
+            if (affectedRows == 0)
+            {
+                bool exists = await _context.Users
+                    .AnyAsync(u => u.StaffId == staffId);
+
+                if (!exists)
+                {
+                    return NotFound(new
+                    {
+                        message = "Không tìm thấy nhân viên."
+                    });
+                }
+
+                return Conflict(new
+                {
+                    message = "Không thể tăng TokenVersion."
+                });
+            }
+
+            // 4. Trả kết quả
+            return Ok(new
+            {
+                message = "Đã thu hồi các JWT hiện tại của nhân viên."
             });
         }
     }

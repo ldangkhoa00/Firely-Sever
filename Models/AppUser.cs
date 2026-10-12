@@ -30,6 +30,11 @@ namespace HospitalUsers.Models
         
         // Trạng thái tài khoản (Active, Pending, Suspended)
         public string Status { get; set; } = "PENDING_APPROVAL";
-        public string ManagedRoom { get; set; } = string.Empty; 
+        public string ManagedRoom { get; set; } = string.Empty;
+
+
+        // Phiên bản xác thực để quản lý thu hồi JWT
+        public int TokenVersion { get; set; } = 1;
+
     }
 }
