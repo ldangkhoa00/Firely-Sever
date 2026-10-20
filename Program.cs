@@ -5,6 +5,9 @@ using Microsoft.IdentityModel.Tokens;
 using System.Text;
 using System.Security.Claims;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.AspNetCore.RateLimiting;
+using System.Threading.RateLimiting;
+
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -58,6 +61,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
                 var tokenVersionText = context.Principal?
                     .FindFirst("TokenVersion")?.Value;
+                
 
 
                 // 2. Kiểm tra JWT có đủ thông tin cần thiết
@@ -95,18 +99,18 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                     context.Fail("Quyen truy cap da thay doi.");
                     return;
                 }
-
-                // 7. Kiểm tra TokenVersion trong JWT
+                
+                // 7. Kiểm tra phiên bản xác thực của JWT
                 if (!int.TryParse(tokenVersionText, out int jwtVersion))
                 {
-                    context.Fail("JWT thieu TokenVersion hoac gia tri khong hop le.");
+                    context.Fail("JWT thieu TokenVersion hoac TokenVersion khong hop le.");
                     return;
                 }
 
-                // 8. So sánh phiên bản JWT với Database
+                // So sánh phiên bản JWT với phiên bản trong Database
                 if (jwtVersion != user.TokenVersion)
                 {
-                    context.Fail("JWT da bi thu hoi.");
+                    context.Fail("JWT da bi thu hoi hoac khong con hop le.");
                     return;
                 }
 
@@ -115,7 +119,43 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
     });
 
-builder.Services.AddControllers();
+        builder.Services.AddControllers();
+
+        // BẢO MẬT: Giới hạn số lần gọi API đăng nhập
+
+        builder.Services.AddRateLimiter(options =>
+        {
+            // Trả HTTP 429 khi vượt giới hạn           
+            options.RejectionStatusCode =
+                StatusCodes.Status429TooManyRequests;
+
+            // CHÍNH SÁCH 1: Đăng nhập
+            // Tối đa 10 yêu cầu trong 1 phút trên mỗi IP
+            options.AddPolicy("login", context =>
+                RateLimitPartition.GetFixedWindowLimiter(
+                    partitionKey: context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+                    factory: _ => new FixedWindowRateLimiterOptions
+                    {
+                        PermitLimit = 10,
+                        Window = TimeSpan.FromMinutes(1),
+                        QueueLimit = 0,
+                        AutoReplenishment = true
+                    }));
+
+            // CHÍNH SÁCH 2: Đăng ký
+            // Tối đa 5 yêu cầu trong 10 phút trên mỗi IP
+            options.AddPolicy("register", context =>
+                RateLimitPartition.GetFixedWindowLimiter(
+                    partitionKey: context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+                    factory: _ => new FixedWindowRateLimiterOptions
+                    {
+                        PermitLimit = 5,
+                        Window = TimeSpan.FromMinutes(10),
+                        QueueLimit = 0,
+                        AutoReplenishment = true
+                    }));
+    });
+
 
 // [BỔ SUNG] 3. Đăng ký dịch vụ Swagger để tự động quét các API của bạn
 builder.Services.AddEndpointsApiExplorer();
@@ -130,8 +170,18 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// 5. Kích hoạt cửa an ninh
+
+// 5. Xác định API mà người dùng đang gọi
+app.UseRouting();
+
+// 6. Kích hoạt Rate Limiting
+app.UseRateLimiter();
+
+// 7. Kích hoạt xác thực JWT và phân quyền
 app.UseAuthentication();
 app.UseAuthorization();
+
+// 8. Kết nối các API Controller
 app.MapControllers();
+
 app.Run();
