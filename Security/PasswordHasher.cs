@@ -1,34 +1,75 @@
-using BCrypt.Net; // Cần thiết để sử dụng thư viện băm BCrypt
+using System;
+using System.Text;
 
 namespace HospitalUsers.Security
 {
-    // Lớp này chứa các công cụ hỗ trợ xử lý mật khẩu
+    /// <summary>
+    /// Bam va xac minh mat khau nhan vien bang BCrypt.Net-Next.
+    /// Giu nguyen API HashPassword/VerifyPassword de tuong thich AuthController.
+    /// </summary>
     public static class PasswordHasher
     {
+        // BCrypt truyen thong chi xu ly toi da 72 byte, khong phai 72 ky tu.
+        // Dong bo gioi han voi AuthController (dang ky va dang nhap).
+        public const int MaxPasswordBytes = 72;
+
+        // Work factor chi ap dung cho hash MOI. Hash cu van duoc Verify binh thuong
+        // vi he so tinh toan va salt duoc luu ngay trong chuoi hash.
+        private const int WorkFactor = 12;
+
         /// <summary>
-        /// Hàm này nhận vào mật khẩu dạng chữ thường (plain text) 
-        /// và trả về một chuỗi mã băm (hash) lộn xộn không thể đọc được.
+        /// Bam mat khau va tu sinh salt ngau nhien cho moi lan goi.
+        /// Khong trim / chuyen doi mat khau vi se thay doi gia tri mat khau.
         /// </summary>
-        /// <param name="password">Mật khẩu người dùng nhập vào</param>
-        /// <returns>Chuỗi mật khẩu đã được băm</returns>
         public static string HashPassword(string password)
         {
-            // Sử dụng thuật toán BCrypt với số vòng lặp ngẫu nhiên (work factor mặc định thường là 11)
-            // Càng nhiều vòng lặp, việc băm càng chậm nhưng càng an toàn trước các cuộc tấn công Brute-Force
-            return BCrypt.Net.BCrypt.HashPassword(password);
+            ArgumentNullException.ThrowIfNull(password);
+
+            if (string.IsNullOrWhiteSpace(password))
+            {
+                throw new ArgumentException(
+                    "Mat khau khong duoc de trong hoac chi co khoang trang.",
+                    nameof(password));
+            }
+
+            if (Encoding.UTF8.GetByteCount(password) > MaxPasswordBytes)
+            {
+                throw new ArgumentException(
+                    "Mat khau khong duoc vuot qua 72 byte UTF-8.",
+                    nameof(password));
+            }
+
+            // BCrypt.Net tu sinh salt; khong tu tao/luu salt rieng.
+            return BCrypt.Net.BCrypt.HashPassword(password, workFactor: WorkFactor);
         }
 
         /// <summary>
-        /// Hàm này dùng để kiểm tra khi người dùng đăng nhập.
-        /// So sánh mật khẩu người dùng vừa nhập với chuỗi băm đang lưu trong Database.
+        /// Xac minh mat khau. Tra false neu input khong hop le hoac hash bi hong.
+        /// Khong nang work factor tai day, khong thay doi hash da luu trong CSDL.
         /// </summary>
-        /// <param name="password">Mật khẩu người dùng vừa gõ trên khung đăng nhập</param>
-        /// <param name="hashedPassword">Mã băm lấy từ cơ sở dữ liệu lên</param>
-        /// <returns>Trả về true nếu khớp, false nếu sai mật khẩu</returns>
-        public static bool VerifyPassword(string password, string hashedPassword)
+        public static bool VerifyPassword(string? password, string? hashedPassword)
         {
-            // So sánh mật khẩu trơn với mã băm
-            return BCrypt.Net.BCrypt.Verify(password, hashedPassword);
+            if (string.IsNullOrEmpty(password) ||
+                Encoding.UTF8.GetByteCount(password) > MaxPasswordBytes ||
+                string.IsNullOrWhiteSpace(hashedPassword) ||
+                hashedPassword.Length != 60)
+            {
+                return false;
+            }
+
+            try
+            {
+                return BCrypt.Net.BCrypt.Verify(password, hashedPassword);
+            }
+            catch (BCrypt.Net.SaltParseException)
+            {
+                // Hash trong CSDL bi loi dinh dang: tu choi xac thuc.
+                return false;
+            }
+            catch (ArgumentException)
+            {
+                return false;
+            }
         }
     }
 }

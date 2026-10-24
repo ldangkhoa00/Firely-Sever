@@ -1,38 +1,68 @@
+using HospitalUsers.DTOs.Iot;
+using HospitalUsers.Security;
+using HospitalUsers.Services.Iot;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Hl7.Fhir.Model;
-using Hl7.Fhir.Serialization;
-using HospitalUsers.Data;
-using HospitalUsers.Models;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace HospitalUsers.Controllers
 {
-    [Route("api/[controller]")]
     [ApiController]
-    public class IotController : ControllerBase
+    [Route("api/[controller]")]
+    public sealed class IotController : ControllerBase
     {
-        private readonly AppDbContext _context;
-        public IotController(AppDbContext context) { _context = context; }
+        private readonly IIotCsiService _iotCsiService;
 
-        public class EspPayload { public string Room { get; set; } = ""; public string CsiData { get; set; } = ""; }
-
-        [HttpPost("csi")]
-        public IActionResult ReceiveCsi([FromBody] EspPayload payload)
+        public IotController(IIotCsiService iotCsiService)
         {
-            // Dùng Firely SDK bọc mảng sóng thô vào chuẩn FHIR
-            var obs = new Observation
+            _iotCsiService = iotCsiService;
+        }
+
+        // POST /api/Iot/csi: keep the existing route, auth scheme and response.
+        [HttpPost("csi")]
+        [Authorize(AuthenticationSchemes = DeviceApiKeyAuthenticationHandler.SchemeName)]
+        [EnableRateLimiting("device-csi")]
+        [RequestSizeLimit(256 * 1024)]
+        public async Task<IActionResult> ReceiveCsi(
+            [FromBody] EspCsiPayloadDto? payload,
+            CancellationToken cancellationToken)
+        {
+            if (payload is null)
             {
-                Id = Guid.NewGuid().ToString(),
-                Status = ObservationStatus.Final,
-                Code = new CodeableConcept("http://loinc.org", "CSI-WIFI", "WiFi Channel State"),
-                Value = new FhirString(payload.CsiData)
+                return BadRequest(new { message = "Thiếu dữ liệu CSI." });
+            }
+
+            IotCsiResult result = await _iotCsiService.ReceiveAsync(
+                payload, cancellationToken);
+
+            return result switch
+            {
+                IotCsiResult.Received => Ok("Đã nhận dữ liệu CSI"),
+                IotCsiResult.MissingRoom => BadRequest(new
+                {
+                    message = "Mã phòng không được để trống."
+                }),
+                IotCsiResult.MissingCsiData => BadRequest(new
+                {
+                    message = "Dữ liệu CSI không được để trống."
+                }),
+                IotCsiResult.InvalidRoomLength => BadRequest(new
+                {
+                    message = "Mã phòng không được vượt quá 50 ký tự."
+                }),
+                IotCsiResult.InvalidCsiLength => BadRequest(new
+                {
+                    message = "Dữ liệu CSI vượt quá kích thước cho phép."
+                }),
+                IotCsiResult.StorageFailed => StatusCode(500, new
+                {
+                    message = "Không thể lưu dữ liệu CSI."
+                }),
+                _ => StatusCode(500, new
+                {
+                    message = "Không thể xử lý dữ liệu CSI."
+                })
             };
-
-            var json = new FhirJsonSerializer().SerializeToString(obs);
-
-            _context.CsiRecords.Add(new CsiRecord { RoomNumber = payload.Room, FhirObservationJson = json });
-            _context.SaveChanges();
-
-            return Ok("Đã nhận dữ liệu CSI");
         }
     }
 }

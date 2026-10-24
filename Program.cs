@@ -1,96 +1,126 @@
 using HospitalUsers.Data;
+using HospitalUsers.Security;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.IdentityModel.Tokens;
-using System.Text;
-using System.Security.Claims;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.IdentityModel.Tokens;
+using System.Security.Claims;
+using System.Text;
 using System.Threading.RateLimiting;
-
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. Cấu hình kết nối SQL Server (Lấy từ appsettings.json)
+// UDP LAN discovery: disabled by default until udp-discovery.json is configured.
+builder.Configuration.AddJsonFile("udp-discovery.json", optional: true, reloadOnChange: false);
+builder.Services.Configure<HospitalUsers.Services.Discovery.UdpDiscoveryOptions>(
+    builder.Configuration.GetSection(HospitalUsers.Services.Discovery.UdpDiscoveryOptions.SectionName));
+builder.Services.AddHostedService<HospitalUsers.Services.Discovery.UdpDiscoveryHostedService>();
+builder.Services.AddScoped<HospitalUsers.Services.FhirObservation.IFhirObservationService, HospitalUsers.Services.FhirObservation.FhirObservationService>();
+builder.Services.AddScoped<HospitalUsers.Services.Iot.IIotCsiService, HospitalUsers.Services.Iot.IotCsiService>();
+
+// ============================================================
+// 1. SQL SERVER
+// ============================================================
+string? connectionString =
+    builder.Configuration.GetConnectionString("DefaultConnection");
+
+if (string.IsNullOrWhiteSpace(connectionString))
+{
+    throw new InvalidOperationException(
+        "Chua cau hinh ConnectionStrings:DefaultConnection.");
+}
+
 builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+    options.UseSqlServer(connectionString));
 
-// 2. Thiết lập Bảo vệ bằng JWT (Phân quyền Bác sĩ, Y tá, IT)
-
-var jwtKey = builder.Configuration["JwtSettings:Key"];
+// ============================================================
+// 2. AUTHENTICATION: JWT CHO NHAN VIEN + API KEY CHO ESP32
+// ============================================================
+string? jwtKey = builder.Configuration["JwtSettings:Key"];
 
 if (string.IsNullOrWhiteSpace(jwtKey))
 {
     throw new InvalidOperationException(
-        "Chua cau hinh JwtSettings:Key. Server khong the khoi dong."
-    );
+        "Chua cau hinh JwtSettings:Key. Server khong the khoi dong.");
 }
 
-if (Encoding.UTF8.GetByteCount(jwtKey) < 32)
+byte[] jwtKeyBytes = Encoding.UTF8.GetBytes(jwtKey);
+
+if (jwtKeyBytes.Length < 32)
 {
     throw new InvalidOperationException(
-        "JWT Secret phai co it nhat 32 byte UTF-8."
-    );
+        "JWT Secret phai co it nhat 32 byte UTF-8.");
 }
 
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+// Bearer van la scheme MAC DINH cho cac endpoint nhan vien.
+// DeviceApiKey chi duoc dung khi endpoint yeu cau scheme nay.
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
         options.TokenValidationParameters = new TokenValidationParameters
         {
             ValidateIssuerSigningKey = true,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
+            IssuerSigningKey = new SymmetricSecurityKey(jwtKeyBytes),
+            RequireSignedTokens = true,
+            ValidAlgorithms = new[] { SecurityAlgorithms.HmacSha256 },
+            ValidateLifetime = true,
+            RequireExpirationTime = true,
+            ClockSkew = TimeSpan.FromMinutes(1),
+
+            // GIU TUONG THICH voi token hien tai: AuthController chua
+            // gan Issuer/Audience khi tao JWT. Can bo sung DONG BO
+            // ben phat hanh token truoc khi bat hai kiem tra nay.
             ValidateIssuer = false,
-            ValidateAudience = false
+            ValidateAudience = false,
+
+            NameClaimType = ClaimTypes.NameIdentifier,
+            RoleClaimType = ClaimTypes.Role
         };
 
-                
         options.Events = new JwtBearerEvents
         {
             OnTokenValidated = async context =>
             {
-                // 1. Lấy thông tin nhân viên từ JWT
-                var staffId = context.Principal?
+                var principal = context.Principal;
+
+                string? staffId = principal?
                     .FindFirst(ClaimTypes.NameIdentifier)?.Value;
-
-                var tokenRole = context.Principal?
+                string? tokenRole = principal?
                     .FindFirst(ClaimTypes.Role)?.Value;
-
-                var tokenDepartment = context.Principal?
+                string? tokenDepartment = principal?
                     .FindFirst("DepartmentId")?.Value;
-
-                var tokenVersionText = context.Principal?
+                string? tokenVersionText = principal?
                     .FindFirst("TokenVersion")?.Value;
-                
 
-
-                // 2. Kiểm tra JWT có đủ thông tin cần thiết
                 if (string.IsNullOrWhiteSpace(staffId) ||
                     string.IsNullOrWhiteSpace(tokenRole) ||
-                    tokenDepartment == null)
+                    tokenDepartment == null ||
+                    !int.TryParse(tokenVersionText, out int tokenVersion))
                 {
-                    context.Fail("JWT thieu thong tin bat buoc.");
+                    context.Fail("JWT thieu hoac sai thong tin bat buoc.");
                     return;
                 }
 
-                // 3. Lấy DbContext từ Dependency Injection
+                // JWT hop le ve chu ky van phai duoc doi chieu voi
+                // trang thai tai khoan, vai tro va TokenVersion trong DB.
                 var db = context.HttpContext.RequestServices
                     .GetRequiredService<AppDbContext>();
 
-                // 4. Tìm tài khoản hiện tại trong SQL Server
                 var user = await db.Users
                     .AsNoTracking()
-                    .FirstOrDefaultAsync(u => u.StaffId == staffId);
-                    
+                    .FirstOrDefaultAsync(
+                        u => u.StaffId == staffId,
+                        context.HttpContext.RequestAborted);
 
-                // 5. Nếu tài khoản không tồn tại hoặc bị khóa
                 if (user == null || user.Status != "ACTIVE")
                 {
                     context.Fail("Tai khoan khong con hoat dong.");
                     return;
                 }
 
-                // 6. Nếu vai trò hoặc khoa/phòng đã thay đổi
                 if (!string.Equals(user.Role, tokenRole,
                         StringComparison.Ordinal) ||
                     !string.Equals(user.DepartmentId, tokenDepartment,
@@ -99,89 +129,106 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                     context.Fail("Quyen truy cap da thay doi.");
                     return;
                 }
-                
-                // 7. Kiểm tra phiên bản xác thực của JWT
-                if (!int.TryParse(tokenVersionText, out int jwtVersion))
-                {
-                    context.Fail("JWT thieu TokenVersion hoac TokenVersion khong hop le.");
-                    return;
-                }
 
-                // So sánh phiên bản JWT với phiên bản trong Database
-                if (jwtVersion != user.TokenVersion)
+                if (user.TokenVersion != tokenVersion)
                 {
                     context.Fail("JWT da bi thu hoi hoac khong con hop le.");
-                    return;
                 }
-
             }
         };
+    })
+    .AddScheme<AuthenticationSchemeOptions,
+        DeviceApiKeyAuthenticationHandler>(
+        DeviceApiKeyAuthenticationHandler.SchemeName,
+        options => { });
 
-    });
+// Dang ky phan quyen ro rang. Khong bat fallback policy de khong
+// thay doi cac endpoint [AllowAnonymous] cua du an hien tai.
+builder.Services.AddAuthorization();
+builder.Services.AddControllers();
+// Security Audit Logs: read-only filtering and pagination.
+builder.Services.AddScoped<HospitalUsers.Services.SecurityAuditLogs.ISecurityAuditLogService, HospitalUsers.Services.SecurityAuditLogs.SecurityAuditLogService>();
+// CSI room authorization and read-only business logic.
+builder.Services.AddScoped<HospitalUsers.Services.Csi.ICsiService, HospitalUsers.Services.Csi.CsiService>();
+// Departments business logic. DbContext lifetime is scoped.
+builder.Services.AddScoped<HospitalUsers.Services.Departments.IDepartmentService, HospitalUsers.Services.Departments.DepartmentService>();
+// Auth business logic is scoped to the HTTP request / DbContext.
+builder.Services.AddScoped<HospitalUsers.Services.Auth.IAuthService, HospitalUsers.Services.Auth.AuthService>();
 
-        builder.Services.AddControllers();
+// ============================================================
+// 3. RATE LIMITING: LOGIN, REGISTER, DEVICE CSI
+// ============================================================
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode =
+        StatusCodes.Status429TooManyRequests;
 
-        // BẢO MẬT: Giới hạn số lần gọi API đăng nhập
+    // 10 yeu cau / 1 phut / IP
+    options.AddPolicy("login", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: context.Connection.RemoteIpAddress?.ToString()
+                ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
 
-        builder.Services.AddRateLimiter(options =>
-        {
-            // Trả HTTP 429 khi vượt giới hạn           
-            options.RejectionStatusCode =
-                StatusCodes.Status429TooManyRequests;
+    // 5 yeu cau / 10 phut / IP
+    options.AddPolicy("register", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: context.Connection.RemoteIpAddress?.ToString()
+                ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 5,
+                Window = TimeSpan.FromMinutes(10),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
 
-            // CHÍNH SÁCH 1: Đăng nhập
-            // Tối đa 10 yêu cầu trong 1 phút trên mỗi IP
-            options.AddPolicy("login", context =>
-                RateLimitPartition.GetFixedWindowLimiter(
-                    partitionKey: context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
-                    factory: _ => new FixedWindowRateLimiterOptions
-                    {
-                        PermitLimit = 10,
-                        Window = TimeSpan.FromMinutes(1),
-                        QueueLimit = 0,
-                        AutoReplenishment = true
-                    }));
+    // 60 yeu cau / 1 phut / IP - muc THU NGHIEM cho ESP32.
+    // IoT va FhirObservation chia se cung policy/partition theo IP.
+    options.AddPolicy("device-csi", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: context.Connection.RemoteIpAddress?.ToString()
+                ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 60,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+});
 
-            // CHÍNH SÁCH 2: Đăng ký
-            // Tối đa 5 yêu cầu trong 10 phút trên mỗi IP
-            options.AddPolicy("register", context =>
-                RateLimitPartition.GetFixedWindowLimiter(
-                    partitionKey: context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
-                    factory: _ => new FixedWindowRateLimiterOptions
-                    {
-                        PermitLimit = 5,
-                        Window = TimeSpan.FromMinutes(10),
-                        QueueLimit = 0,
-                        AutoReplenishment = true
-                    }));
-    });
-
-
-// [BỔ SUNG] 3. Đăng ký dịch vụ Swagger để tự động quét các API của bạn
+// ============================================================
+// 4. SWAGGER - CHI DEVELOPMENT
+// ============================================================
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
 
-// [BỔ SUNG] 4. Kích hoạt giao diện web Swagger (chỉ chạy trong môi trường code/Development)
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
     app.UseSwaggerUI();
 }
 
-
-// 5. Xác định API mà người dùng đang gọi
+// ============================================================
+// 5. HTTP PIPELINE
+// ============================================================
 app.UseRouting();
 
-// 6. Kích hoạt Rate Limiting
+// Phai dat SAU UseRouting cho [EnableRateLimiting("...")].
+// Giu truoc authentication de ca yeu cau thieu key bi tinh limit.
 app.UseRateLimiter();
 
-// 7. Kích hoạt xác thực JWT và phân quyền
 app.UseAuthentication();
 app.UseAuthorization();
 
-// 8. Kết nối các API Controller
 app.MapControllers();
-
 app.Run();

@@ -1,0 +1,11 @@
+{
+    "UdpDiscovery":  {
+                         "Enabled":  true,
+                         "Port":  37020,
+                         "AdvertisedApiUrl":  "http://192.168.1.35:5241",
+                         "AllowedSubnets":  [
+                                                "127.0.0.1/32",
+                                                "192.168.1.0/24"
+                                            ]
+                     }
+}
